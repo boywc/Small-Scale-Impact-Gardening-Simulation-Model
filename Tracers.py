@@ -1,3 +1,24 @@
+"""
+Tracers：颗粒追迹与搬运模块
+
+本模块职责
+----------
+1) 定义 Tracer 粒子对象，记录并更新其 (x,y,z) 位置与历史轨迹（深度/坡度）；
+2) 在两类过程下更新粒子位置：
+   - 地形扩散（diffusion）引起的粒子就地/顺坡移动或越界处理；
+   - 陨击坑事件（crater）引起的表面弹射、填充、连续喷出物掩埋、地下流动/喷射等；
+3) 提供若干求解器：
+   - solve_for_landing_point：给定初速度/方向与地形插值，求粒子返回地表的时间；
+   - solve_for_ejection_point：给定地下流线参数，求粒子出露（与旧表面相交）时刻；
+4) 生成三维粒子群（build_tracers_group）用于统计层厚与混合深度等。
+
+坐标/单位约定
+-------------
+- 网格索引：x 为列索引、y 为行索引（与图像/数组一致），z 为高程（向上为正）；
+- 长度：像素索引通过 `params.resolution`（m/px）换算为物理尺度；重力 g，时间 yr；
+- 角度：弧度制；
+"""
+
 import params
 import numpy as np
 import matplotlib.pyplot as plt
@@ -5,10 +26,24 @@ import sys
 from scipy import interpolate
 from scipy.optimize import minimize
 
+
 class Tracer:
+    """
+    表示一个可被地形过程搬运/更新的“示踪粒子”。
+
+    Attributes:
+        x_p, y_p, z_p (float): 当前粒子位置（像素索引+高程），x/y 为整数索引时需注意边界。
+        x_arr, y_arr, z_arr (list[float]): 历史轨迹（每步记录）。
+        d_arr (list[float]): 历史深度 = 表面高程 - 粒子高程（>0 为埋藏，=0 在表面）。
+        slope_arr (list[float]): 粒子所在位置的坡度历史（弧度）。
+    """
+
     def __init__(self, x_p0, y_p0, z_p0):
-            # Initialize particle position with x,y,z position
-            # Create arrays to store the particle's trajectory
+        """
+        初始化粒子位置与轨迹缓存。
+        """
+        # Initialize particle position with x,y,z position
+        # Create arrays to store the particle's trajectory
         self.x_p = x_p0
         self.y_p = y_p0
         self.z_p = z_p0
@@ -19,17 +54,31 @@ class Tracer:
         self.slope_arr = []
 
     def current_position(self):
+        """
+        返回当前粒子位置 [x, y, z]（用于作为搬运/更新函数的输入）。
+        """
         # Return the particle's current position
         # Should be used to get inputs for transportation methods
         return [self.x_p, self.y_p, self.z_p]
 
     def update_position(self, new_position):
+        """
+        用 new_position = [x, y, z] 就地更新粒子位置。
+        """
         # Update particle's current position
         self.x_p = new_position[0]
         self.y_p = new_position[1]
         self.z_p = new_position[2]
 
     def update_trajectory(self, x_p, y_p, z_p, d_p, slope_p):
+        """
+        在每个时间步结束时，记录粒子轨迹与状态量。
+
+        Args:
+            x_p, y_p, z_p (float): 本步结束时粒子位置。
+            d_p (float): 深度（表面高程 - 粒子高程）。
+            slope_p (float): 该像素处坡度（弧度）。
+        """
         # Update particle history at the end of each timestep
         # Store x,y,z position as well as depth and the slope of the grid at the particle's position
         self.x_arr.append(x_p)
@@ -40,6 +89,25 @@ class Tracer:
 
     # 地形退化对颗粒追迹的影响
     def tracer_particle_diffusion(self, grid_old, grid_new, particle_pos):
+        """
+        扩散过程下的粒子更新（单步）。
+
+        规则（分类）：
+            CLASS 0：传入 NaN，原样返回 NaN（容错）；
+            CLASS 1：粒子在边界像素，无法计算差分，按是否周期性粒子处理（重采样或丢失）；
+            CLASS 2：粒子位于内部：
+                - SCENARIO 1：地表变换后粒子仍在地表/以下 -> 原地不动；
+                - SCENARIO 2：地表抬升导致粒子“负深度” -> 选择 3×3 邻域最陡下坡方向移动 1 像素；
+                  若越界，则按周期性粒子或丢失处理；新深度考虑 δh 与原始埋深 d_p0。
+
+        Args:
+            grid_old (ndarray): 扩散前的高程栅格。
+            grid_new (ndarray): 扩散后的高程栅格。
+            particle_pos (list/ndarray): [x, y, z] 当前粒子位置。
+
+        Returns:
+            list[float]: 更新后的 [x, y, z]。
+        """
         diffusivity = params.diffusivity
         dt = params.dt
         dx2 = params.dx2
@@ -106,7 +174,7 @@ class Tracer:
 
                 # 颗粒九宫格方向
                 # Possible directions to move, I will be going from left to right then down to the next row
-                # 可能的移动方向，我将从左到右，然后向下移动到下一排
+                # 可能的移动方向：左→右，上→下（九邻域）
                 # (i-1, j+1)    (i, j+1)    (i+1, j+1)
                 # (i-1, j)      (i, j)      (i+1, j)
                 # (i-1, j-1)    (i, j-1)    (i+1, j-1)
@@ -133,7 +201,7 @@ class Tracer:
                 delta_z[2, 1] = delta_z_32
                 delta_z[2, 2] = delta_z_33
 
-                # 对角线方向用三角函数算一下
+                # 对角线方向的水平距离：√2·resolution；正交方向：resolution
                 rad_ext_11 = np.sqrt(2.0*resolution**2)
                 rad_ext_12 = resolution
                 rad_ext_13 = np.sqrt(2.0*resolution**2)
@@ -144,6 +212,7 @@ class Tracer:
                 rad_ext_32 = resolution
                 rad_ext_33 = np.sqrt(2.0*resolution**2)
 
+                # 局部坡度（以 arctan2(Δz, Δr) 表示）
                 slope_11 = np.arctan2(delta_z_11, rad_ext_11)
                 slope_12 = np.arctan2(delta_z_12, rad_ext_12)
                 slope_13 = np.arctan2(delta_z_13, rad_ext_13)
@@ -154,20 +223,21 @@ class Tracer:
                 slope_32 = np.arctan2(delta_z_32, rad_ext_32)
                 slope_33 = np.arctan2(delta_z_33, rad_ext_33)
 
+                # 九方向位移映射（索引与上面 slope 顺序一致）
                 x_change = [-1, 0, 1, -1, 0, 1, -1,  0,  1]
                 y_change = [1, 1, 1,  0, 0, 0, -1, -1, -1]
-                # 计算哪个方向梯度最大就向哪个方向移动
+                # 选择最陡下坡方向
                 max_slope_dir = np.argmax([slope_11, slope_12, slope_13, slope_21, slope_22, slope_23, slope_31, slope_32, slope_33], axis=0)
 
                 x_p += x_change[max_slope_dir]
                 y_p += y_change[max_slope_dir]
-                # 如果粒子没滚出去
+                # 如果粒子仍在网格内
                 if 0 <= x_p <= (grid_size-1) and 0 <= y_p <= (grid_size-1):
                         # Particle moves somewhere on the grid.  Placed at a depth correspondingly inversely to its initial depth (layers are flipped as material near the surface moves downslope first, followed by material buried deeper)
                     x_p = int(round(x_p))
                     y_p = int(round(y_p))
                     z_p = grid_new[x_p, y_p] - delta_h + d_p0 # 同时考虑了埋在地下的和在表面的两种情况，并且地形退化影响到了这个深度的粒子
-                # 如果粒子滚出去了
+                # 如果粒子越界
                 else:
                     # Particle diffuses off the grid
 
@@ -185,6 +255,7 @@ class Tracer:
                         z_p = np.nan
                 # FINAL PARTICLE POSITION DETERMINED - C2:S2
 
+        # 出口一致性检查：深度应为非负
         d_p = grid_new[int(x_p), int(y_p)] - z_p
         if d_p < 0.0: # 如果地形退化没有影响到这个颗粒
             print('PARTICLE ABOVE THE SURFACE - END OF DIFFUSION FUNCTION')
@@ -194,6 +265,18 @@ class Tracer:
         return [x_p, y_p, z_p]
 
     def solve_for_landing_point(self, t, *args):
+        """
+        目标函数（供最优化器调用）：给定飞行时间 t，计算“粒子高度”与“新表面高度”的差值绝对值。
+
+        用途：L-BFGS-B 在 t≥0 上最小化该差值 -> 求得粒子着陆时刻（与地表相交）。
+
+        Args:
+            t (float): 候选飞行时间。
+            *args: (R0, ejection_velocity_vertical, x_crater_pix, y_crater_pix, phi0, f_surf_new, z_p0)
+
+        Returns:
+            float: | z_surface(x(t), y(t)) - z_particle(t) |
+        """
         resolution = params.resolution
         g = params.g
 
@@ -219,6 +302,18 @@ class Tracer:
         return abs(z_t_surf - z_t_flight)
 
     def solve_for_ejection_point(self, t, *args):
+        """
+        目标函数（供最优化器调用）：给定地下流动时间 t，计算“粒子流线高度”与“旧表面高度”的差值绝对值。
+
+        用途：L-BFGS-B 在 0≤t<0.99·t_max 上最小化该差值 -> 求得粒子出露时刻（与旧地表相交）。
+
+        Args:
+            t (float): 候选地下流动时间。
+            *args: (R0, x_crater_pix, y_crater_pix, phi0, theta0, alpha, f_surf_old)
+
+        Returns:
+            float: | z_surface_old(x(t), y(t)) - z_streamline(t) |
+        """
         resolution = params.resolution
 
         R0 = args[0]
@@ -241,6 +336,36 @@ class Tracer:
         return abs(z_t_surf - z_t_flow)
 
     def tracer_particle_crater(self, x_p0, y_p0, z_p0, d_p0, dx, dy, dz, x_crater_pix, y_crater_pix, R0, crater_radius, grid_old, grid_new):
+        """
+        陨击坑事件下的粒子更新（单步）。
+
+        分类与情景（与原注释一致）：
+            CLASS 0：传入 NaN，原样返回 NaN；
+            CLASS 1：d_p0 < 0，粒子在表面之上（非物理，退出）；
+            CLASS 2：d_p0 = 0，粒子位于表面，且 R0 在影响范围内：
+                S1：R0=0，撞击点湮灭；周期性则重生；
+                S2：0<R0≤R_transient，表面弹射（解着陆时刻，落点可能在网格外/喷出毯内随机埋深）；
+                S3：R_transient<R0≤R_final，填充（breccia lens 内随机放置）；
+                S4：R0>R_final，表面掩埋（连续喷出物毯）；
+            CLASS 3：d_p0 > 0，粒子在地下，且 R0 在影响范围内：
+                S0：R0≥factor·R_final，影响范围外 -> 保持不动（但限幅到新表面以下）；
+                S1：dx=dy=0 钻孔式下沉（仅 z 变更）；
+                S2：地下喷射（在冻结前出露到表面并再次着陆）；
+                S3A：常数 alpha 近似导致的“非物理”出露到表面以上，做截断到新表面；
+                S3B：正常地下流动到冻结时刻（落在 grid 内或越界周期处理）。
+
+        Args:
+            x_p0, y_p0, z_p0 (float): 初始粒子位置。
+            d_p0 (float): 初始深度（表面-粒子）。
+            dx, dy, dz (float): 粒子相对撞击点的初始向量分量。
+            x_crater_pix, y_crater_pix (int): 撞击中心像素坐标。
+            R0 (float): 初始球坐标半径（相对撞击点）。
+            crater_radius (float): 最终坑半径。
+            grid_old, grid_new (ndarray): 事件前/后的地表高程。
+
+        Returns:
+            list[float]: 更新后的 [x, y, z]。
+        """
         plot_on = 0
         print_on = 0
 
@@ -779,6 +904,7 @@ class Tracer:
                                 plt.plot(x_p0, z_p0, 'rX')
                         # FINAL PARTICLE POSITION DETERMINED - C3:S3
 
+        # 出口一致性检查：深度应为非负
         d_p = grid_new[int(x_p), int(y_p)] - z_p
         if d_p < 0.0:
             print('PARTICLE ABOVE THE SURFACE - END OF CRATER FUNCTION')
@@ -788,6 +914,13 @@ class Tracer:
         return [x_p, y_p, z_p]
 
     def sample_noise_val(self):
+        """
+        从给定分布采样一个“高程噪声”值（用于亚像素小坑的统计影响）。
+
+        Notes:
+            - 使用 Johnson SU 分布：`st.johnsonsu`；当前文件未导入 `scipy.stats as st`。
+              若需要调用该函数，请在工程入口补充 `from scipy import stats as st` 或等效导入。
+        """
         # Sample elevation noise values from a given distribution
         dist = st.johnsonsu
 
@@ -798,6 +931,23 @@ class Tracer:
         return noise_val
 
     def tracer_particle_noise(self, x_p0, y_p0, z_p0, grid_old, noise):
+        """
+        亚像素（统计）小坑对粒子的影响：仅修改 z，不进行水平位移。
+
+        规则：
+            - noise = 0：保持不变；
+            - noise < 0：等效挖掘 -> z 上移 |noise|；
+            - noise > 0：等效填充 -> z 下移 |noise|；
+            - 若 z 超过旧表面 -> 放回旧表面；
+
+        Args:
+            x_p0, y_p0, z_p0 (float): 初始粒子位置。
+            grid_old (ndarray): 参考表面（像素参考高程）。
+            noise (float): 噪声强度（正填充/负挖掘）。
+
+        Returns:
+            list[float]: 更新后的 [x, y, z]。
+        """
         # Movement of tracer particles from the addition of sub-pixel cratering
         # Particles are not moved horizontally.  If cratering removes material from the particle's pixel and excavates the particle to be above the surface,
         # Place the particle on the new surface at the same pixel
@@ -832,17 +982,24 @@ class Tracer:
         return [x_p, y_p, z_p]
 
 
-
-
 def build_tracers_group():
+    """
+    生成规则三维粒子群（x×y×z 的网格化采样）。
 
+    设计：
+        - 在 x/y 方向各取 n_particles_per_layer 个整点（避开边界 5 像素）
+        - 在 z 方向取 100 个层位，均匀于 [0, -1]，并将表面层设为 0.0
+        - 返回一个 Tracer 列表（长度 = n^2×100）
+
+    Returns:
+        list[Tracer]: 粒子对象列表。
+    """
     n_pd = params.n_particles_per_layer  # 10
     x_points = np.linspace(5, params.grid_size - 5, n_pd, dtype=np.int32)
     y_points = np.linspace(5, params.grid_size - 5, n_pd, dtype=np.int32)
     z_points = -1.0 * np.linspace(0, 1, 100)
     z_points[0] = 0.0
     print(z_points)
-
 
     XX, YY, ZZ = np.meshgrid(x_points, y_points, z_points)
     # shape (25, 25, 25) (25, 25, 25) (25, 25, 25)
