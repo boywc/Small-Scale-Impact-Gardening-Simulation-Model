@@ -62,7 +62,7 @@ if __name__ == '__main__':
                                        X_grid,
                                        Y_grid,
                                        ones_grid)
-            np.copyto(grid_old, grid_new)
+            # np.copyto(grid_old, grid_new)
 
             partical_depth_now = []
             for j in range(len(tracers)):
@@ -92,10 +92,11 @@ if __name__ == '__main__':
                                                                                   crater_radius, grid_old, grid_new)
 
                         tracers[j].update_position(particle_position_new)
-            else:
-                partical_depth_now.append(-9999)
+                else:
+                    partical_depth_now.append(-9999)
 
             partical_depth_all.append(partical_depth_now)
+            np.copyto(grid_old, grid_new)
 
         print("\n")
 
@@ -106,7 +107,3 @@ if __name__ == '__main__':
     np.save(params.save_dir + 'Crater_Map.npy', grid_new)
     plt.imshow(grid_new)
     plt.show()
-
-
-
-
